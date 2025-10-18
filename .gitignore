@@ -1,0 +1,9 @@
+# macOS specific files
+.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+
+# saved results, models, plots 
+output/
