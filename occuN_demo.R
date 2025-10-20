@@ -15,7 +15,7 @@ for(p in packages){
     if (!requireNamespace(p, quietly = FALSE)) install.packages(p)
 }
 
-# Quietly install your forked 'unmarked' package
+# Quietly install forked 'unmarked' package
 suppressMessages(
     devtools::install_github("nahian-ahmed/unmarked", ref = "occuN", force = TRUE, quiet = FALSE)
 )
@@ -37,17 +37,50 @@ set.seed(123) # for reproducibility
 #######################
 
 # Fits the occuN model and calculates metrics.
-fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster) {
+fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster, n_restarts = 30, optimizer_method = "BFGS") {
 
-    # a. Fit the occuN model
+    # a. Create the unmarkedFrame
     umf <- unmarked::unmarkedFrameOccuN(y = y_data, cellCovs = as.data.frame(landscape_raster),
                                 obsCovs = obs_covs, w = w_matrix)
 
-    fit <- unmarked::occuN(~obs_cov ~state_cov, data = umf, starts = c(alpha_true, beta_true))
+    # Multiple restarts logic
+    best_fit <- NULL
+    min_nll <- Inf
 
-    # b. Calculate and return all necessary results
-    beta_est <- coef(fit, type = 'state')
-    alpha_est <- coef(fit, type = 'det')
+    num_params <- 2 + 2
+
+    cat("  Starting optimization with", n_restarts, "restarts using", optimizer_method, "...\n")
+
+    for (i in 1:n_restarts) {
+        random_starts <- runif(num_params, min = -5, max = 5)
+        current_fit <- try(
+            unmarked::occuN(~obs_cov ~state_cov, data = umf, starts = random_starts, se = FALSE, method = optimizer_method),
+            silent = TRUE
+        )
+
+        if (!inherits(current_fit, "try-error")) {
+            current_nll <- current_fit@negLogLike
+            if (is.finite(current_nll) && current_nll < min_nll) {
+                min_nll <- current_nll
+                best_fit <- current_fit
+                cat("    New best fit found at restart", i, "with NLL:", format(min_nll, digits = 15), "\n")
+            }
+        }
+    }
+
+    if (is.null(best_fit)) {
+        warning("All model fitting attempts failed or resulted in non-finite NLL.")
+        # Return a structure indicating failure
+        return(list(fit = NULL, metrics = data.frame(beta_intercept=NA, beta_1=NA, alpha_intercept=NA, alpha_1=NA,
+                                                     lambda_pt_mse=NA, psi_pt_mse=NA, lambda_ls_mse=NA, psi_ls_mse=NA),
+                    pred_lambda_map = setValues(landscape_raster, NA),
+                    pred_psi_map = setValues(landscape_raster, NA)))
+    }
+
+    final_fit <- unmarked::occuN(~obs_cov ~state_cov, data = umf, starts = coef(best_fit), se = TRUE, method = optimizer_method)
+
+    beta_est <- coef(final_fit, type = 'state')
+    alpha_est <- coef(final_fit, type = 'det')
 
     pred_lambda_val <- exp(X_val %*% beta_est)
     pred_psi_val <- 1 - exp(-pred_lambda_val)
@@ -56,12 +89,10 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster)
     pred_psi_landscape <- 1 - exp(-pred_lambda_landscape)
 
     return(list(
-        fit = fit,
+        fit = final_fit,
         metrics = data.frame(
-            beta_intercept = beta_est[1],
-            beta_1 = beta_est[2],
-            alpha_intercept = alpha_est[1],
-            alpha_1 = alpha_est[2],
+            beta_intercept = beta_est[1], beta_1 = beta_est[2],
+            alpha_intercept = alpha_est[1], alpha_1 = alpha_est[2],
             lambda_pt_mse = mean((true_lambda_val - pred_lambda_val)^2),
             psi_pt_mse = mean((true_psi_val - pred_psi_val)^2),
             lambda_ls_mse = mean((true_lambda_j - pred_lambda_landscape)^2),
@@ -71,6 +102,7 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster)
         pred_psi_map = setValues(landscape_raster, pred_psi_landscape)
     ))
 }
+
 
 # Helper function to generate cellSq clusterings.
 create_cellSq_clusters <- function(points_df, landscape_raster, cell_side_length) {
@@ -111,7 +143,10 @@ values(state_cov) <- scales::rescale(xy[,1] + xy[,2] + rnorm(n_cells, 0, 10))
 names(state_cov) <- "state_cov"
 
 # True parameters
-beta_true <- c("(Intercept)" = 1.5, "state_cov" = -2.5)
+# beta_true <- c("(Intercept)" = 1.5, "state_cov" = -2.5)
+# alpha_true <- c("(Intercept)" = 1.0, "obs_cov" = -1.5)
+
+beta_true <- c("(Intercept)" = 1.0, "state_cov" = -2.5)
 alpha_true <- c("(Intercept)" = 1.0, "obs_cov" = -1.5)
 
 
@@ -135,14 +170,14 @@ if(any(true_N_j > 0)) {
     individual_points_list <- list()
     cells_with_individuals <- which(true_N_j > 0)
     for(cell_idx in cells_with_individuals) {
-        
+
         # Fetch no. of individuals for this cell
         n_inds <- true_N_j[cell_idx]
-        
+
         # Calculate cell centers
         center_x <- cell_coords[cell_idx, "x"]
         center_y <- cell_coords[cell_idx, "y"]
-        
+
         # Randomly distribute individuals in each cell based on N_j (n_inds).
         rand_x <- runif(n_inds, min = center_x - res_x/2, max = center_x + res_x/2)
         rand_y <- runif(n_inds, min = center_y - res_y/2, max = center_y + res_y/2)
@@ -156,7 +191,7 @@ if(any(true_N_j > 0)) {
 }
 
 # Simulate total points and split into train/validation (constant across experiments)
-n_points_total <- 1000
+n_points_total <- 5000
 points_df <- data.frame(id = 1:n_points_total, x = runif(n_points_total, 0, n_cells_side), y = runif(n_points_total, 0, n_cells_side))
 train_pts_df_base <- points_df %>% sample_frac(0.7)
 val_pts_df <- points_df %>% anti_join(train_pts_df_base, by = "id")
@@ -177,6 +212,11 @@ output_dir <- "output"
 if (!dir.exists(output_dir)) {
     dir.create(output_dir)
 }
+
+
+# Manually select one optimizer for the entire run
+# Possible values: "BFGS", "nlminb", "Nelder-Mead", "CG", "L-BFGS-B", "SANN"
+selected_optimizer <- "BFGS"
 
 
 reference_scenarios <- c("clustGeo-50-25", "clustGeo-50-10", "clustGeo-50-90", "1-cellSq", "5-cellSq")
@@ -262,6 +302,8 @@ for (ref_scenario_name in reference_scenarios) {
     ########################################################################
     # 5. CLUSTERING SCENARIOS: Cluster Points, Aggregate Data, and Analyze
     ########################################################################
+
+   
     
     # a. Define the different clustGeo scenarios to test
     if (exists("ref_tree")) {
@@ -289,6 +331,8 @@ for (ref_scenario_name in reference_scenarios) {
 
     # d. Run the pipeline for each scenario using a for loop to access scenario names
     results <- list()
+    cat(paste("\n===== USING OPTIMIZER:", selected_optimizer, "=====\n"))
+
     for (current_scenario_name in names(all_scenarios)) {
         cat(paste("    - Method:", current_scenario_name, "\n"))
         cl <- all_scenarios[[current_scenario_name]]
@@ -347,7 +391,7 @@ for (ref_scenario_name in reference_scenarios) {
             w_matrix_row_idx <- which(site_data$current_site_id == actual_site_id)
             w_matrix[w_matrix_row_idx, cell_idx] <- weights_extract[i, "weight"]
         }
-        analysis_results <- fit_and_evaluate_occuN(y_data, obs_covs_for_umf, w_matrix, state_cov)
+        analysis_results <- fit_and_evaluate_occuN(y_data, obs_covs_for_umf, w_matrix, state_cov, optimizer_method = selected_optimizer)
 
         # Calculate ARI and add it to the results list for plotting
         current_ari <- ARI(ref_clusters, cl)
@@ -362,6 +406,7 @@ for (ref_scenario_name in reference_scenarios) {
             "No." = perf_counter,
             "Reference.Clustering" = ref_scenario_name,
             "Clustering" = current_scenario_name,
+            "Optimizer" = selected_optimizer,
             "Cell.Lambda.Mean" = round(pred_cell_stats[1, "mean"], 4),
             "Cell.Lambda.SD" = round(pred_cell_stats[1, "sd"], 4),
             "Cell.Psi.Mean" = round(pred_cell_stats[2, "mean"], 4),
@@ -377,9 +422,9 @@ for (ref_scenario_name in reference_scenarios) {
 
         results[[current_scenario_name]] <- c(list(polygons = polygons_df), analysis_results)
     }
-    
+
     #################################
-    # 6. PLOT GENERATION (7x4 GRID) 
+    # 6. PLOT GENERATION (7x4 GRID)
     #################################
 
     original_scenario_order <- names(results)
@@ -388,23 +433,28 @@ for (ref_scenario_name in reference_scenarios) {
     results <- results[plot_order]
 
     # Save PNG to output folder
-    png_filename <- file.path(output_dir, paste0("comparison_plot_ref=", ref_scenario_name, ".png"))
+    png_filename <- file.path(output_dir, paste0("ref=", ref_scenario_name, "_opt=", selected_optimizer, ".png"))
     png(png_filename, width = 14, height = 20, units = "in", res = 300)
     cat(paste("Generating plot:", png_filename, "\n"))
 
-    max_vals <- c(global(true_lambda_map, max, na.rm = TRUE)$max, sapply(results, function(res) global(res$pred_lambda_map, max, na.rm = TRUE)$max))
-    lambda_max <- max(max_vals, na.rm = TRUE)
+    # Make color scaling robust to NA/Inf values
+    valid_pred_maps <- Filter(function(res) !all(is.na(values(res$pred_lambda_map))), results)
+    max_vals <- c(global(true_lambda_map, "max", na.rm = TRUE)$max,
+                  sapply(valid_pred_maps, function(res) global(res$pred_lambda_map, "max", na.rm = TRUE)$max))
+    lambda_max <- max(unlist(max_vals), na.rm = TRUE)
+    if (!is.finite(lambda_max)) lambda_max <- 10 # Fallback value
+
 
     par(cex = 2.0)
     layout(matrix(1:28, nrow = 7, byrow = TRUE), widths = c(1, 1, 1, 0.8), heights = c(1,1, 1, 1, 1, 1,1))
 
     # c(bottom, left, top, right) vector.
-    margin_default <- c(0,0,0,0)   
+    margin_default <- c(0,0,0,0)
     text_offset = -0.75
 
     # ROW 1: Ground Truth Point Pattern, Abundance, and Occupancy
     par(mar = margin_default)
-    
+
     # Plot state_cov as a background with no legend to ensure alignment
     plot(state_cov, main = "Point Pattern", legend = FALSE, col = "white")
 
@@ -412,13 +462,13 @@ for (ref_scenario_name in reference_scenarios) {
     if(nrow(all_individuals_df) > 0) {
       points(all_individuals_df$x, all_individuals_df$y, pch = 16, col = "red", cex = 0.5)
     }
-    
+
     par(mar = margin_default)
     # Abundance Pattern
     plot(true_N_map, main = "Abundance Pattern", col = viridis(100, option="cividis"))
-    text(x = xyFromCell(true_N_map, 1:ncell(true_N_map))[,1], 
-        y = xyFromCell(true_N_map, 1:ncell(true_N_map))[,2], 
-        labels = values(true_N_map), 
+    text(x = xyFromCell(true_N_map, 1:ncell(true_N_map))[,1],
+        y = xyFromCell(true_N_map, 1:ncell(true_N_map))[,2],
+        labels = values(true_N_map),
         cex = 0.6, col = "white")
 
     # Occurrence Pattern
@@ -436,15 +486,15 @@ for (ref_scenario_name in reference_scenarios) {
 
     # ROW 2: Reference
     par(mar = margin_default)
-    plot(state_cov, main = "State Covariate & Observations", col = viridis(100, , option = "turbo"))
-    points(train_pts_df$x, train_pts_df$y, pch = 16, col = "blue", cex = 1.0)
-    points(val_pts_df$x, val_pts_df$y, pch = 17, col = "magenta1", cex = 1.0)
+    plot(state_cov, main = paste("Covariate & Obs (Optimizer: ", selected_optimizer, ")", sep=""), col = viridis(100, , option = "turbo"))
+    points(train_pts_df$x, train_pts_df$y, pch = 16, col = "blue", cex = 0.5)
+    points(val_pts_df$x, val_pts_df$y, pch = 17, col = "magenta1", cex = 0.5)
     legend("bottom", legend = c("Train", "Val"), col = c("blue", "magenta1"), pch = c(16, 17), horiz = TRUE, bg="white", cex=1.0)
-    
+
     par(mar = margin_default)
     plot(true_lambda_map, main = "Reference Expected Abundance", col = viridis(100, option = "viridis"), range = c(0, lambda_max))
     plot(true_psi_map, main = "Reference Occupancy Probability", col = viridis(100, option = "magma"), range=c(0,1))
-    
+
     par(mar=c(0,0,0,0))
     plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", xlab="", ylab="")
     text(text_offset, 0.7, "Reference Parameters", pos=4, font=2, cex=1.2)
@@ -466,16 +516,21 @@ for (ref_scenario_name in reference_scenarios) {
         }
 
         par(mar = margin_default)
-        # Plot the state covariate raster as a background with no legend and background
         plot(state_cov, main = trailing_ref_str, legend = FALSE, col = "white")
-        # Add the polygons and points on top of the empty raster
         plot(res$polygons$geometry, add = TRUE, border = "gray30", col = alpha("gray", 0.3))
         points(train_pts_df$x, train_pts_df$y, pch = 16, col = "blue", cex = 0.5)
-        
-        par(mar = margin_default)
-        plot(res$pred_lambda_map, main = paste("Abundance Estimated from", current_scenario_name), col = viridis(100, option = "viridis"), range = c(0, lambda_max))
-        plot(res$pred_psi_map, main = paste("Occupancy Estimated from", current_scenario_name), col = viridis(100, option = "magma"), range=c(0,1))
-        
+
+        # Check for failed fits before plotting rasters
+        if(is.null(res$fit) || all(is.na(values(res$pred_lambda_map)))) {
+            par(mar = margin_default)
+            plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n"); text(0, 0, "Fit Failed", cex=1.5)
+            plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n"); text(0, 0, "Fit Failed", cex=1.5)
+        } else {
+            par(mar = margin_default)
+            plot(res$pred_lambda_map, main = paste("Abundance Estimated from", current_scenario_name), col = viridis(100, option = "viridis"), range = c(0, lambda_max))
+            plot(res$pred_psi_map, main = paste("Occupancy Estimated from", current_scenario_name), col = viridis(100, option = "magma"), range=c(0,1))
+        }
+
         par(mar=c(0,0,0,0))
         plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", xlab="", ylab="")
         text(text_offset, 0.8, "Estimated Parameters", pos=4, font=2, cex=1.2)
@@ -487,13 +542,20 @@ for (ref_scenario_name in reference_scenarios) {
 
         text(text_offset, -0.15, "Metrics", pos=4, font=2, cex=1.2)
         text(text_offset, -0.28, paste("ARI:", round(res$ari, 4)), pos=4, cex=1.2)
-        text(text_offset, -0.41, paste("Val. Pts. Abun. MSE:", formatC(metrics$lambda_pt_mse, format = "e", digits = 2)), pos=4, cex=1.2)
-        text(text_offset, -0.54, paste("Val. Pts. Occ. MSE:", formatC(metrics$psi_pt_mse, format = "e", digits = 2)), pos=4, cex=1.2)
-        text(text_offset, -0.67, paste("Cell Abun. MSE:", formatC(metrics$lambda_ls_mse, format = "e", digits = 2)), pos=4, cex=1.2)
-        text(text_offset, -0.80, paste("Cell Occu. MSE:", formatC(metrics$psi_ls_mse, format = "e", digits = 2)), pos=4, cex=1.2)
 
-        # Reset margin
-        par(mar = margin_default) 
+        # Check for NA before formatting each MSE value.
+        lambda_pt_mse_text <- if (is.na(metrics$lambda_pt_mse)) "NA" else formatC(metrics$lambda_pt_mse, format = "e", digits = 2)
+        psi_pt_mse_text <- if (is.na(metrics$psi_pt_mse)) "NA" else formatC(metrics$psi_pt_mse, format = "e", digits = 2)
+        lambda_ls_mse_text <- if (is.na(metrics$lambda_ls_mse)) "NA" else formatC(metrics$lambda_ls_mse, format = "e", digits = 2)
+        psi_ls_mse_text <- if (is.na(metrics$psi_ls_mse)) "NA" else formatC(metrics$psi_ls_mse, format = "e", digits = 2)
+
+        text(text_offset, -0.41, paste("Val. Pts. Abun. MSE:", lambda_pt_mse_text), pos=4, cex=1.2)
+        text(text_offset, -0.54, paste("Val. Pts. Occ. MSE:", psi_pt_mse_text), pos=4, cex=1.2)
+        text(text_offset, -0.67, paste("Cell Abun. MSE:", lambda_ls_mse_text), pos=4, cex=1.2)
+        text(text_offset, -0.80, paste("Cell Occu. MSE:", psi_ls_mse_text), pos=4, cex=1.2)
+
+
+        par(mar = margin_default)
     }
     dev.off()
 }
