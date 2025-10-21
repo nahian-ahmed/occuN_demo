@@ -9,8 +9,8 @@
 ######################################################
 
 options(repos = c(CRAN = "https://cloud.r-project.org/"))
-# Added 'aricode' for calculating Adjusted Rand Index (ARI)
-packages <- c("devtools", "sf", "terra", "dplyr", "scales", "viridis", "ClustGeo", "aricode")
+# Added 'aricode' for ARI and 'PRROC' for AUROC calculation
+packages <- c("devtools", "sf", "terra", "dplyr", "scales", "viridis", "ClustGeo", "aricode", "PRROC")
 for(p in packages){
     if (!requireNamespace(p, quietly = FALSE)) install.packages(p)
 }
@@ -28,6 +28,7 @@ library(scales)
 library(viridis)
 library(ClustGeo)
 library(aricode)
+library(PRROC)
 
 
 set.seed(123) # for reproducibility
@@ -37,7 +38,7 @@ set.seed(123) # for reproducibility
 #######################
 
 # Fits the occuN model and calculates metrics.
-fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster, n_restarts = 30, optimizer_method = "BFGS") {
+fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster, val_data, n_restarts = 30, optimizer_method = "BFGS") {
 
     # a. Create the unmarkedFrame
     umf <- unmarked::unmarkedFrameOccuN(y = y_data, cellCovs = as.data.frame(landscape_raster),
@@ -47,9 +48,10 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
     best_fit <- NULL
     min_nll <- Inf
 
-    num_params <- 2 + 2
+    # num_params: 2 for state (intercept, cov), 2 for detection (intercept, cov)
+    num_params <- 4 
 
-    cat("  Starting optimization with", n_restarts, "restarts using", optimizer_method, "...\n")
+    cat("  Starting optimization with", n_restarts, "restarts...\n")
 
     for (i in 1:n_restarts) {
         random_starts <- runif(num_params, min = -5, max = 5)
@@ -72,7 +74,7 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
         warning("All model fitting attempts failed or resulted in non-finite NLL.")
         # Return a structure indicating failure
         return(list(fit = NULL, metrics = data.frame(beta_intercept=NA, beta_1=NA, alpha_intercept=NA, alpha_1=NA,
-                                                     lambda_pt_mse=NA, psi_pt_mse=NA, lambda_ls_mse=NA, psi_ls_mse=NA),
+                                                     lambda_pt_mse=NA, psi_pt_mse=NA, lambda_ls_mse=NA, psi_ls_mse=NA, auroc=NA),
                     pred_lambda_map = setValues(landscape_raster, NA),
                     pred_psi_map = setValues(landscape_raster, NA)))
     }
@@ -82,9 +84,31 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
     beta_est <- coef(final_fit, type = 'state')
     alpha_est <- coef(final_fit, type = 'det')
 
-    pred_lambda_val <- exp(X_val %*% beta_est)
+    # Predictions on validation points
+    pred_lambda_val <- exp(val_data$X_val %*% beta_est)
     pred_psi_val <- 1 - exp(-pred_lambda_val)
+    
+    # Predicted detection probability for validation points
+    val_obs_cov_df <- data.frame(obs_cov = val_data$obs_cov)
+    X_p_val <- model.matrix(~obs_cov, data=val_obs_cov_df)
+    pred_p_val <- plogis(X_p_val %*% alpha_est)
 
+    # Marginal probability of detection at validation points (for AUC)
+    pred_marginal_det <- as.vector(pred_psi_val * pred_p_val)
+    
+    # Calculate AUROC using PRROC
+    scores.class1 <- pred_marginal_det[val_data$y_val_obs == 1]
+    scores.class0 <- pred_marginal_det[val_data$y_val_obs == 0]
+    
+    # Handle cases where one class is missing in the validation data
+    if(length(scores.class1) > 0 && length(scores.class0) > 0){
+        roc_result <- PRROC::roc.curve(scores.class1 = scores.class1, scores.class0 = scores.class0, curve = FALSE)
+        auroc_val <- roc_result$auc
+    } else {
+        auroc_val <- NA
+    }
+
+    # Predictions on the entire landscape
     pred_lambda_landscape <- exp(X_truth_all_cells %*% beta_est)
     pred_psi_landscape <- 1 - exp(-pred_lambda_landscape)
 
@@ -96,7 +120,8 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
             lambda_pt_mse = mean((true_lambda_val - pred_lambda_val)^2),
             psi_pt_mse = mean((true_psi_val - pred_psi_val)^2),
             lambda_ls_mse = mean((true_lambda_j - pred_lambda_landscape)^2),
-            psi_ls_mse = mean((true_psi_j - pred_psi_landscape)^2)
+            psi_ls_mse = mean((true_psi_j - pred_psi_landscape)^2),
+            auroc = auroc_val
         ),
         pred_lambda_map = setValues(landscape_raster, pred_lambda_landscape),
         pred_psi_map = setValues(landscape_raster, pred_psi_landscape)
@@ -143,12 +168,8 @@ values(state_cov) <- scales::rescale(xy[,1] + xy[,2] + rnorm(n_cells, 0, 10))
 names(state_cov) <- "state_cov"
 
 # True parameters
-# beta_true <- c("(Intercept)" = 1.5, "state_cov" = -2.5)
-# alpha_true <- c("(Intercept)" = 1.0, "obs_cov" = -1.5)
-
-beta_true <- c("(Intercept)" = 1.0, "state_cov" = -2.5)
+beta_true <- c("(Intercept)" = 0.5, "state_cov" = -3.0)
 alpha_true <- c("(Intercept)" = 1.0, "obs_cov" = -1.5)
-
 
 # True landscape values
 cell_covs_df <- as.data.frame(state_cov, cells = TRUE)
@@ -191,7 +212,7 @@ if(any(true_N_j > 0)) {
 }
 
 # Simulate total points and split into train/validation (constant across experiments)
-n_points_total <- 5000
+n_points_total <- 2000
 points_df <- data.frame(id = 1:n_points_total, x = runif(n_points_total, 0, n_cells_side), y = runif(n_points_total, 0, n_cells_side))
 train_pts_df_base <- points_df %>% sample_frac(0.7)
 val_pts_df <- points_df %>% anti_join(train_pts_df_base, by = "id")
@@ -202,6 +223,18 @@ X_val <- model.matrix(~state_cov, data=val_pts_covs)
 val_cell_indices <- cellFromXY(state_cov, val_pts_df[,c("x","y")])
 true_lambda_val <- true_lambda_j[val_cell_indices]
 true_psi_val <- true_psi_j[val_cell_indices]
+
+# Simulate observed detections (y) for validation points for AUC calculation
+val_pts_df$obs_cov <- runif(nrow(val_pts_df))
+p_det_val <- plogis(alpha_true[1] + alpha_true[2] * val_pts_df$obs_cov)
+true_z_val <- true_N_j[val_cell_indices] > 0
+y_val_obs <- rbinom(length(true_z_val), 1, p_det_val * true_z_val)
+
+val_data_list <- list(
+    y_val_obs = y_val_obs,
+    X_val = X_val,
+    obs_cov = val_pts_df$obs_cov
+)
 
 ###############################################################
 # 4. MAIN LOOP: Iterate through each reference scenario
@@ -214,9 +247,9 @@ if (!dir.exists(output_dir)) {
 }
 
 
-# Manually select one optimizer for the entire run
+# Select optimizer
 # Possible values: "BFGS", "nlminb", "Nelder-Mead", "CG", "L-BFGS-B", "SANN"
-selected_optimizer <- "BFGS"
+selected_optimizer <- "nlminb"
 
 
 reference_scenarios <- c("clustGeo-50-25", "clustGeo-50-10", "clustGeo-50-90", "1-cellSq", "5-cellSq")
@@ -224,6 +257,7 @@ reference_scenarios <- c("clustGeo-50-25", "clustGeo-50-10", "clustGeo-50-90", "
 # Initialize data frames to store summary statistics for CSV export
 descriptive_stats_df <- data.frame()
 performance_metrics_df <- data.frame()
+estimated_params_df <- data.frame() # New dataframe for estimated parameters
 perf_counter <- 1
 
 for (ref_scenario_name in reference_scenarios) {
@@ -303,8 +337,6 @@ for (ref_scenario_name in reference_scenarios) {
     # 5. CLUSTERING SCENARIOS: Cluster Points, Aggregate Data, and Analyze
     ########################################################################
 
-   
-    
     # a. Define the different clustGeo scenarios to test
     if (exists("ref_tree")) {
             n_unique_pts <- nrow(unique(train_pts_df[, c("x", "y")]))
@@ -331,7 +363,6 @@ for (ref_scenario_name in reference_scenarios) {
 
     # d. Run the pipeline for each scenario using a for loop to access scenario names
     results <- list()
-    cat(paste("\n===== USING OPTIMIZER:", selected_optimizer, "=====\n"))
 
     for (current_scenario_name in names(all_scenarios)) {
         cat(paste("    - Method:", current_scenario_name, "\n"))
@@ -391,11 +422,23 @@ for (ref_scenario_name in reference_scenarios) {
             w_matrix_row_idx <- which(site_data$current_site_id == actual_site_id)
             w_matrix[w_matrix_row_idx, cell_idx] <- weights_extract[i, "weight"]
         }
-        analysis_results <- fit_and_evaluate_occuN(y_data, obs_covs_for_umf, w_matrix, state_cov, optimizer_method = selected_optimizer)
+        
+        analysis_results <- fit_and_evaluate_occuN(y_data, obs_covs_for_umf, w_matrix, state_cov, val_data=val_data_list, optimizer_method = selected_optimizer)
 
         # Calculate ARI and add it to the results list for plotting
         current_ari <- ARI(ref_clusters, cl)
         analysis_results$ari <- current_ari
+
+        # Store estimated parameters for CSV export
+        new_params_row <- data.frame(
+            "Reference.Clustering" = ref_scenario_name,
+            "Clustering" = current_scenario_name,
+            "beta_intercept" = analysis_results$metrics$beta_intercept,
+            "beta_1" = analysis_results$metrics$beta_1,
+            "alpha_intercept" = analysis_results$metrics$alpha_intercept,
+            "alpha_1" = analysis_results$metrics$alpha_1
+        )
+        estimated_params_df <- rbind(estimated_params_df, new_params_row)
 
         # Calculate and store performance metrics
         pred_cell_stats <- global(c(analysis_results$pred_lambda_map, analysis_results$pred_psi_map), c("mean", "sd"), na.rm=TRUE)
@@ -415,7 +458,8 @@ for (ref_scenario_name in reference_scenarios) {
             "Site.Lambda.SD" = round(sd(pred_site_lambda, na.rm = TRUE), 4),
             "Site.Psi.Mean" = round(mean(pred_site_psi, na.rm = TRUE), 4),
             "Site.Psi.SD" = round(sd(pred_site_psi, na.rm = TRUE), 4),
-            "ARI" = round(current_ari, 4)
+            "ARI" = round(current_ari, 4),
+            "AUROC" = round(analysis_results$metrics$auroc, 4)
         )
         performance_metrics_df <- rbind(performance_metrics_df, new_perf_row)
         perf_counter <- perf_counter + 1
@@ -433,16 +477,28 @@ for (ref_scenario_name in reference_scenarios) {
     results <- results[plot_order]
 
     # Save PNG to output folder
-    png_filename <- file.path(output_dir, paste0("ref=", ref_scenario_name, "_opt=", selected_optimizer, ".png"))
+    png_filename <- file.path(output_dir, paste0("ref=", ref_scenario_name,".png"))
     png(png_filename, width = 14, height = 20, units = "in", res = 300)
     cat(paste("Generating plot:", png_filename, "\n"))
 
-    # Make color scaling robust to NA/Inf values
-    valid_pred_maps <- Filter(function(res) !all(is.na(values(res$pred_lambda_map))), results)
-    max_vals <- c(global(true_lambda_map, "max", na.rm = TRUE)$max,
-                  sapply(valid_pred_maps, function(res) global(res$pred_lambda_map, "max", na.rm = TRUE)$max))
-    lambda_max <- max(unlist(max_vals), na.rm = TRUE)
-    if (!is.finite(lambda_max)) lambda_max <- 10 # Fallback value
+    # # Make color scaling robust to NA/Inf values
+    # valid_pred_maps <- Filter(function(res) !all(is.na(values(res$pred_lambda_map))), results)
+    # max_vals <- c(global(true_lambda_map, "max", na.rm = TRUE)$max,
+    #               sapply(valid_pred_maps, function(res) global(res$pred_lambda_map, "max", na.rm = TRUE)$max))
+    # lambda_max <- max(unlist(max_vals), na.rm = TRUE)
+    # if (!is.finite(lambda_max)) lambda_max <- 10 # Fallback value
+
+    # Calculate the maximum abundance from ONLY the reference map
+    ref_max_val <- global(true_lambda_map, "max", na.rm = TRUE)$max
+
+    # Set the new lambda_max to be % of the reference max
+    lambda_max <- ref_max_val * 1.1
+    
+    # Fallback in case ref_max_val was NA, Inf, or 0
+    if (!is.finite(lambda_max) || lambda_max == 0) {
+        warning("Could not determine a finite reference max; falling back to 10.")
+        lambda_max <- 10 
+    }
 
 
     par(cex = 2.0)
@@ -486,7 +542,7 @@ for (ref_scenario_name in reference_scenarios) {
 
     # ROW 2: Reference
     par(mar = margin_default)
-    plot(state_cov, main = paste("Covariate & Obs (Optimizer: ", selected_optimizer, ")", sep=""), col = viridis(100, , option = "turbo"))
+    plot(state_cov, main = paste("Covariate & Observations", sep=""), col = viridis(100, , option = "turbo"))
     points(train_pts_df$x, train_pts_df$y, pch = 16, col = "blue", cex = 0.5)
     points(val_pts_df$x, val_pts_df$y, pch = 17, col = "magenta1", cex = 0.5)
     legend("bottom", legend = c("Train", "Val"), col = c("blue", "magenta1"), pch = c(16, 17), horiz = TRUE, bg="white", cex=1.0)
@@ -495,13 +551,14 @@ for (ref_scenario_name in reference_scenarios) {
     plot(true_lambda_map, main = "Reference Expected Abundance", col = viridis(100, option = "viridis"), range = c(0, lambda_max))
     plot(true_psi_map, main = "Reference Occupancy Probability", col = viridis(100, option = "magma"), range=c(0,1))
 
+    # MODIFIED: Text block at (2,4) shows simulation stats instead of parameters
     par(mar=c(0,0,0,0))
     plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", xlab="", ylab="")
-    text(text_offset, 0.7, "Reference Parameters", pos=4, font=2, cex=1.2)
-    text(text_offset, 0.5, bquote(beta[0] == .(beta_true[1])), pos=4, cex=1.2)
-    text(text_offset, 0.35, bquote(beta[1] == .(beta_true[2])), pos=4, cex=1.2)
-    text(text_offset, 0.2, bquote(alpha[0] == .(alpha_true[1])), pos=4, cex=1.2)
-    text(text_offset, 0.05, bquote(alpha[1] == .(alpha_true[2])), pos=4, cex=1.2)
+    text(text_offset, 0.7, "Simulation Stats", pos=4, font=2, cex=1.2)
+    text(text_offset, 0.5, paste("Training Pts.:", nrow(train_pts_df_base)), pos=4, cex=1.2)
+    text(text_offset, 0.35, paste("Validation Pts.:", nrow(val_pts_df)), pos=4, cex=1.2)
+    text(text_offset, 0.2, paste("Cell Mean Exp. Abun.:", round(mean(true_lambda_j), 2)), pos=4, cex=1.2)
+    text(text_offset, 0.05, paste("Cell Mean Occu. Prob.:", round(mean(true_psi_j), 2)), pos=4, cex=1.2)
 
     # ROWS 3-7: Clustering Scenarios
     scenario_names <- names(results)
@@ -531,28 +588,28 @@ for (ref_scenario_name in reference_scenarios) {
             plot(res$pred_psi_map, main = paste("Occupancy Estimated from", current_scenario_name), col = viridis(100, option = "magma"), range=c(0,1))
         }
 
+        # MODIFIED: Text blocks for scenarios no longer show estimated parameters
         par(mar=c(0,0,0,0))
         plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", xlab="", ylab="")
-        text(text_offset, 0.8, "Estimated Parameters", pos=4, font=2, cex=1.2)
-
-        text(text_offset, 0.6, bquote(hat(beta)[0] == .(round(metrics$beta_intercept, 2))), pos=4, cex=1.2)
-        text(text_offset, 0.45, bquote(hat(beta)[1] == .(round(metrics$beta_1, 2))), pos=4, cex=1.2)
-        text(text_offset, 0.3, bquote(hat(alpha)[0] == .(round(metrics$alpha_intercept, 2))), pos=4, cex=1.2)
-        text(text_offset, 0.15, bquote(hat(alpha)[1] == .(round(metrics$alpha_1, 2))), pos=4, cex=1.2)
-
-        text(text_offset, -0.15, "Metrics", pos=4, font=2, cex=1.2)
-        text(text_offset, -0.28, paste("ARI:", round(res$ari, 4)), pos=4, cex=1.2)
-
+        
+        text(text_offset, 0.8, "Metrics", pos=4, font=2, cex=1.2)
+        text(text_offset, 0.65, paste("ARI:", round(res$ari, 4)), pos=4, cex=1.2)
+        
         # Check for NA before formatting each MSE value.
-        lambda_pt_mse_text <- if (is.na(metrics$lambda_pt_mse)) "NA" else formatC(metrics$lambda_pt_mse, format = "e", digits = 2)
-        psi_pt_mse_text <- if (is.na(metrics$psi_pt_mse)) "NA" else formatC(metrics$psi_pt_mse, format = "e", digits = 2)
         lambda_ls_mse_text <- if (is.na(metrics$lambda_ls_mse)) "NA" else formatC(metrics$lambda_ls_mse, format = "e", digits = 2)
         psi_ls_mse_text <- if (is.na(metrics$psi_ls_mse)) "NA" else formatC(metrics$psi_ls_mse, format = "e", digits = 2)
+        lambda_pt_mse_text <- if (is.na(metrics$lambda_pt_mse)) "NA" else formatC(metrics$lambda_pt_mse, format = "e", digits = 2)
+        psi_pt_mse_text <- if (is.na(metrics$psi_pt_mse)) "NA" else formatC(metrics$psi_pt_mse, format = "e", digits = 2)
+        
+        text(text_offset, 0.45, paste("Cell Abun. MSE:", lambda_ls_mse_text), pos=4, cex=1.2)
+        text(text_offset, 0.3, paste("Cell Occu. MSE:", psi_ls_mse_text), pos=4, cex=1.2)
+        text(text_offset, 0.15, paste("Val. Pts. Abun. MSE:", lambda_pt_mse_text), pos=4, cex=1.2)
+        text(text_offset, 0.00, paste("Val. Pts. Occ. MSE:", psi_pt_mse_text), pos=4, cex=1.2)
 
-        text(text_offset, -0.41, paste("Val. Pts. Abun. MSE:", lambda_pt_mse_text), pos=4, cex=1.2)
-        text(text_offset, -0.54, paste("Val. Pts. Occ. MSE:", psi_pt_mse_text), pos=4, cex=1.2)
-        text(text_offset, -0.67, paste("Cell Abun. MSE:", lambda_ls_mse_text), pos=4, cex=1.2)
-        text(text_offset, -0.80, paste("Cell Occu. MSE:", psi_ls_mse_text), pos=4, cex=1.2)
+        # Check for NA before formatting AUROC
+        auroc_text <- if (is.na(metrics$auroc)) "NA" else round(metrics$auroc, 4)
+
+        text(text_offset, -0.2, paste("AUC:", auroc_text), pos=4, cex=1.2)
 
 
         par(mar = margin_default)
@@ -567,5 +624,7 @@ for (ref_scenario_name in reference_scenarios) {
 # Save CSVs to output folder
 write.csv(descriptive_stats_df, file.path(output_dir, "descriptive_stats.csv"), row.names = FALSE)
 write.csv(performance_metrics_df, file.path(output_dir, "performance_metrics.csv"), row.names = FALSE)
+write.csv(estimated_params_df, file.path(output_dir, "estimated_parameters.csv"), row.names = FALSE)
 
 cat("\n--- All simulations complete. ---\n")
+
