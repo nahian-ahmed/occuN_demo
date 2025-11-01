@@ -38,8 +38,8 @@ set.seed(123) # for reproducibility
 #######################
 
 # Fits the occuN model and calculates metrics.
-fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster, val_data, n_restarts = 30, optimizer_method = "BFGS",
-                                    lambda_reg_alpha = 0, lambda_reg_beta = 0) {
+# --- MODIFIED: Removed lambda_reg_alpha and lambda_reg_beta arguments ---
+fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster, val_data, n_restarts = 30, optimizer_method = "BFGS") {
 
     # a. Create the unmarkedFrame
     umf <- unmarked::unmarkedFrameOccuN(y = y_data, cellCovs = as.data.frame(landscape_raster),
@@ -49,15 +49,16 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
     best_fit <- NULL
     min_nll <- Inf
 
-    # num_params: 2 for state (intercept, cov), 2 for detection (intercept, cov)
-    num_params <- 5 
+    # --- MODIFIED: num_params is 4 (2 state, 2 det) ---
+    num_params <- 4 
 
     cat("  Starting optimization with", n_restarts, "restarts...\n")
 
     for (i in 1:n_restarts) {
         random_starts <- runif(num_params, min = -5, max = 5)
+        # --- MODIFIED: Removed regularization parameters from occuN call ---
         current_fit <- try(
-            unmarked::occuN(~obs_cov ~state_cov, data = umf, starts = random_starts, se = FALSE, method = optimizer_method, lambda_reg_alpha = lambda_reg_alpha, lambda_reg_beta = lambda_reg_beta),
+            unmarked::occuN(~obs_cov ~state_cov, data = umf, starts = random_starts, se = FALSE, method = optimizer_method),
             silent = TRUE
         )
 
@@ -73,26 +74,41 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
 
     if (is.null(best_fit)) {
         warning("All model fitting attempts failed or resulted in non-finite NLL.")
-        # Return a structure indicating failure
+        # --- MODIFIED: Removed alpha_lambda from failure dataframe ---
         return(list(fit = NULL, metrics = data.frame(beta_intercept=NA, beta_1=NA, alpha_intercept=NA, alpha_1=NA,
                                                      lambda_pt_mse=NA, psi_pt_mse=NA, lambda_ls_mse=NA, psi_ls_mse=NA, auroc=NA),
                     pred_lambda_map = setValues(landscape_raster, NA),
                     pred_psi_map = setValues(landscape_raster, NA)))
     }
 
-    final_fit <- unmarked::occuN(~obs_cov ~state_cov, data = umf, starts = coef(best_fit), se = TRUE, method = optimizer_method, lambda_reg_alpha = lambda_reg_alpha, lambda_reg_beta = lambda_reg_beta)
+    # --- MODIFIED: Removed regularization parameters from occuN call ---
+    final_fit <- unmarked::occuN(~obs_cov ~state_cov, data = umf, starts = coef(best_fit), se = TRUE, method = optimizer_method)
 
+    # --- UPDATED PARAMETER EXTRACTION ---
     beta_est <- coef(final_fit, type = 'state')
     alpha_est <- coef(final_fit, type = 'det')
+    # --- MODIFIED: Removed alpha_lambda_est ---
+    # --- END UPDATE ---
 
     # Predictions on validation points
     pred_lambda_val <- exp(val_data$X_val %*% beta_est)
     pred_psi_val <- 1 - exp(-pred_lambda_val)
     
+    # --- UPDATED PREDICTION LOGIC FOR AUROC ---
     # Predicted detection probability for validation points
     val_obs_cov_df <- data.frame(obs_cov = val_data$obs_cov)
     X_p_val <- model.matrix(~obs_cov, data=val_obs_cov_df)
-    pred_p_val <- plogis(X_p_val %*% alpha_est)
+
+    # --- MODIFIED: Removed log-abundance from detection probability calculation ---
+    # Get predicted log-abundance for validation points (NO LONGER NEEDED FOR P)
+    # pred_log_lambda_val <- log(pred_lambda_val)
+    # Handle -Inf values from log(0) (NO LONGER NEEDED)
+    # pred_log_lambda_val[is.infinite(pred_log_lambda_val)] <- -100 
+        
+    # Calculate logit-p using the
+    pred_p_val_logit <- (X_p_val %*% alpha_est)
+    pred_p_val <- plogis(as.vector(pred_p_val_logit))
+    # --- END UPDATE ---
 
     # Marginal probability of detection at validation points (for AUC)
     pred_marginal_det <- as.vector(pred_psi_val * pred_p_val)
@@ -115,6 +131,8 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
 
     return(list(
         fit = final_fit,
+        # --- UPDATED METRICS DATAFRAME ---
+        # --- MODIFIED: Removed alpha_lambda ---
         metrics = data.frame(
             beta_intercept = beta_est[1], beta_1 = beta_est[2],
             alpha_intercept = alpha_est[1], alpha_1 = alpha_est[2],
@@ -124,6 +142,7 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
             psi_ls_mse = mean((true_psi_j - pred_psi_landscape)^2),
             auroc = auroc_val
         ),
+        # --- END UPDATE ---
         pred_lambda_map = setValues(landscape_raster, pred_lambda_landscape),
         pred_psi_map = setValues(landscape_raster, pred_psi_landscape)
     ))
@@ -168,14 +187,10 @@ values(state_cov) <- scales::rescale(xy[,1] + xy[,2] + rnorm(n_cells, 0, 10))
 names(state_cov) <- "state_cov"
 
 # True parameters
-# beta_true <- c("(Intercept)" = 1.0, "state_cov" = -3.0)
-# alpha_true <- c("(Intercept)" = 1.0, "obs_cov" = -1.5)
-
-# beta_true <- c("(Intercept)" = 1.0, "state_cov" = -2.0)
-# alpha_true <- c("(Intercept)" = 1.0, "obs_cov" = -1.0)
-
-beta_true <- c("(Intercept)" = 1.5, "state_cov" = -2.5)
+beta_true <- c("(Intercept)" = 1.0, "state_cov" = -3.0)
 alpha_true <- c("(Intercept)" = 1.0, "obs_cov" = -1.0)
+# --- MODIFIED: Removed true abundance effect parameter ---
+# --- END ADDITION ---
 
 
 # True landscape values
@@ -232,11 +247,22 @@ val_cell_indices <- cellFromXY(state_cov, val_pts_df[,c("x","y")])
 true_lambda_val <- true_lambda_j[val_cell_indices]
 true_psi_val <- true_psi_j[val_cell_indices]
 
-# Simulate observed detections (y) for validation points for AUC calculation
+# --- UPDATED SIMULATION OF VALIDATION DETECTIONS (y) ---
 val_pts_df$obs_cov <- runif(nrow(val_pts_df))
-p_det_val <- plogis(alpha_true[1] + alpha_true[2] * val_pts_df$obs_cov)
+
+# --- MODIFIED: Removed log-abundance from detection probability calculation ---
+# Get true log-abundance for validation points (NO LONGER NEEDED)
+# true_log_lambda_val <- log(true_lambda_val)
+# Handle -Inf (NO LONGER NEEDED)
+# true_log_lambda_val[is.infinite(true_log_lambda_val)] <- -100
+
+# Calculate logit-p using the
+p_det_val_logit <- alpha_true[1] + alpha_true[2] * val_pts_df$obs_cov
+p_det_val <- plogis(p_det_val_logit)
+
 true_z_val <- true_N_j[val_cell_indices] > 0
 y_val_obs <- rbinom(length(true_z_val), 1, p_det_val * true_z_val)
+# --- END UPDATE ---
 
 val_data_list <- list(
     y_val_obs = y_val_obs,
@@ -273,9 +299,9 @@ cat("Done.\n")
 
 reference_scenarios <- c("clustGeo-50-25", "clustGeo-50-10", "clustGeo-50-90", "1-cellSq", "5-cellSq")
 
-
-lambda_reg_beta = 0.1
-lambda_reg_alpha = 0.1
+# --- MODIFIED: Removed regularization parameter definitions ---
+# lambda_reg_beta = 0.1
+# lambda_reg_alpha = 0.1
 
 
 # Initialize lists to store summary statistics for efficient CSV export
@@ -334,23 +360,43 @@ for (current_train_size in training_sizes) {
             )
         ref_site_true_occupancy <- apply(st_intersects(ref_polygons_sf, individuals_sf, sparse = FALSE), 1, any)
 
-        # Generate the ground-truth detections for each training point
+        # Calculate true site-level lambda and psi by extracting weighted means from true maps
+        true_site_lambda <- terra::extract(true_lambda_map, vect(ref_polygons_sf), fun = "mean", weights = TRUE)[,2]
+        true_site_psi <- terra::extract(true_psi_map, vect(ref_polygons_sf), fun = "mean", weights = TRUE)[,2]
+
+        # --- UPDATED SIMULATION OF TRAINING DETECTIONS ---
+        # Get true lambda for each point's reference site
+        site_lambda_map <- data.frame(ref_site_id = ref_polygons_sf$ref_site_id, true_site_lambda = true_site_lambda)
+        # Ensure ref_site_id is present for the join
+        ref_polygons_sf <- ref_polygons_sf %>% mutate(ref_site_id = 1:nrow(.))
+        site_lambda_map <- data.frame(ref_site_id = ref_polygons_sf$ref_site_id, true_site_lambda = true_site_lambda)
+        train_pts_df <- train_pts_df %>%
+            left_join(site_lambda_map, by = "ref_site_id")
+            
+        # --- MODIFIED: Removed true_log_lambda ---
         train_pts_df <- train_pts_df %>%
             mutate(
                 site_is_occupied = ref_site_true_occupancy[ref_site_id],
                 obs_cov = runif(n())
             )
-        p_detection <- plogis(alpha_true[1] + alpha_true[2] * train_pts_df$obs_cov)
+            
+        # Handle -Inf (NO LONGER NEEDED)
+        # train_pts_df$true_log_lambda[is.infinite(train_pts_df$true_log_lambda)] <- -100
+            
+        # --- MODIFIED: Removed abundance effect from detection logit ---
+        p_detection_logit <- alpha_true[1] + alpha_true[2] * train_pts_df$obs_cov
+        p_detection <- plogis(p_detection_logit)
+            
         train_pts_df$detection <- rbinom(nrow(train_pts_df), 1, p_detection)
         train_pts_df$detection <- train_pts_df$detection * train_pts_df$site_is_occupied
+            
+        # --- MODIFIED: Removed true_log_lambda from cleanup ---
+        # Clean up extra columns
+        train_pts_df <- train_pts_df %>% select(-true_site_lambda)
+        # --- END UPDATE ---
 
 
         points_per_cluster <- train_pts_df %>% count(ref_site_id) %>% pull(n)
-
-        # Calculate true site-level lambda and psi by extracting weighted means from true maps
-        true_site_lambda <- terra::extract(true_lambda_map, vect(ref_polygons_sf), fun = "mean", weights = TRUE)[,2]
-        true_site_psi <- terra::extract(true_psi_map, vect(ref_polygons_sf), fun = "mean", weights = TRUE)[,2]
-
 
         new_desc_row <- data.frame(
             "Reference.Clustering" = ref_scenario_name,
@@ -457,13 +503,16 @@ for (current_train_size in training_sizes) {
                 w_matrix[w_matrix_row_idx, cell_idx] <- weights_extract[i, "weight"]
             }
             
-            analysis_results <- fit_and_evaluate_occuN(y_data, obs_covs_for_umf, w_matrix, state_cov, val_data=val_data_list, optimizer_method = selected_optimizer, lambda_reg_beta = lambda_reg_beta, lambda_reg_alpha = lambda_reg_alpha)
+            # --- MODIFIED: Removed regularization parameters from function call ---
+            analysis_results <- fit_and_evaluate_occuN(y_data, obs_covs_for_umf, w_matrix, state_cov, val_data=val_data_list, optimizer_method = selected_optimizer)
 
             # Calculate ARI and add it to the results list for plotting
             current_ari <- ARI(ref_clusters, cl)
             analysis_results$ari <- current_ari
 
+            # --- UPDATED PARAMETER ROW ---
             # Store estimated parameters for CSV export
+            # --- MODIFIED: Removed alpha_lambda ---
             new_params_row <- data.frame(
                 "Reference.Clustering" = ref_scenario_name,
                 "Training.Size" = current_train_size,
@@ -474,6 +523,7 @@ for (current_train_size in training_sizes) {
                 "alpha_1" = analysis_results$metrics$alpha_1
             )
             estimated_params_list[[length(estimated_params_list) + 1]] <- new_params_row
+            # --- END UPDATE ---
 
             # Calculate and store performance metrics
             pred_cell_stats <- global(c(analysis_results$pred_lambda_map, analysis_results$pred_psi_map), c("mean", "sd"), na.rm=TRUE)
@@ -539,37 +589,32 @@ for (current_train_size in training_sizes) {
             lambda_max <- 10 
         }
 
-        # --- NEW LEGEND LOGIC START ---
-        # Generate a "pretty" set of breaks based on the 0-max range
-        # These will be our default ticks
-        abun_breaks <- pretty(c(0, lambda_max))
+        # --- *** FIX 2: ROBUST LEGEND AXIS LOGIC *** ---
+        # Generate a "pretty" set of breaks, but *exclude* the max
+        # This gets us the "internal" ticks
+        abun_breaks_internal <- pretty(c(0, lambda_max * 0.9))
         
-        # Ensure the breaks don't go below 0
-        abun_breaks <- abun_breaks[abun_breaks >= 0]
+        # Ensure breaks don't go below 0 or at/past the max
+        abun_breaks_internal <- abun_breaks_internal[abun_breaks_internal >= 0 & abun_breaks_internal < lambda_max]
         
-        # Create character labels for all breaks
-        abun_labels <- as.character(abun_breaks)
+        # Add the lambda_max value as the *final* break
+        abun_breaks <- c(abun_breaks_internal, lambda_max)
         
-        # Find the index of the last label
-        last_label_index <- length(abun_labels)
+        # Create labels for all internal breaks
+        abun_labels <- as.character(abun_breaks_internal)
         
-        # Get the rounded max value (from the reference map) for the label
+        # Get the rounded max value for the last label
         lambda_max_rounded <- round(lambda_max, 1)
         
-        # Modify *only* the last label to show ">"
-        abun_labels[last_label_index] <- paste0(">", lambda_max_rounded)
+        # Add the final label with a ">" sign
+        abun_labels <- c(abun_labels, paste0(">", lambda_max_rounded))
         
-        # CRITICAL: Adjust the *position* of the last break to match
-        # the *actual* lambda_max, so the ">N" label points to the
-        # true end of the color scale.
-        abun_breaks[last_label_index] <- lambda_max
-
-        # This list will be passed to the plg argument
-        abun_legend_args <- list(
+        # This list will be passed to the pax argument
+        abun_axis_args <- list(
             at = abun_breaks,
             labels = abun_labels
         )
-        # --- NEW LEGEND LOGIC END ---
+        # --- *** END FIX 2 *** ---
 
 
         # Define color palettes to be used in plots
@@ -589,6 +634,7 @@ for (current_train_size in training_sizes) {
         par(mar = margin_default)
 
         # Plot state_cov as a background with no legend to ensure alignment
+        # This plot (col 1) HAS axes by default because legend=FALSE
         plot(state_cov, main = "Point Pattern", legend = FALSE, col = "white")
 
         # Add the individual points to the plot, only if there are any
@@ -598,7 +644,8 @@ for (current_train_size in training_sizes) {
 
         par(mar = margin_default)
         # Abundance Pattern
-        plot(true_N_map, main = "Abundance Pattern", col = viridis(100, option="cividis"))
+        # --- *** AXIS FIX: Added axes = TRUE *** ---
+        plot(true_N_map, main = "Abundance Pattern", col = viridis(100, option="cividis"), axes = TRUE)
         text(x = xyFromCell(true_N_map, 1:ncell(true_N_map))[,1],
             y = xyFromCell(true_N_map, 1:ncell(true_N_map))[,2],
             labels = values(true_N_map),
@@ -606,6 +653,7 @@ for (current_train_size in training_sizes) {
 
         # Occurrence Pattern
         true_occ_map <- ifel(true_N_map > 0, 1, 0)
+        # This plot (col 3) HAS axes by default because legend=FALSE
         plot(true_occ_map, main = "Occurrence Pattern", col = c("black", "white"), legend = FALSE)
 
 
@@ -619,16 +667,19 @@ for (current_train_size in training_sizes) {
 
         # ROW 2: Reference
         par(mar = margin_default)
-        plot(state_cov, main = "Covariate & Observations", col = covariate_col_palette)
+        # --- *** AXIS FIX: Added axes = TRUE *** ---
+        plot(state_cov, main = "Covariate & Observations", col = covariate_col_palette, axes = TRUE)
         points(train_pts_df$x, train_pts_df$y, pch = 16, col = "blue", cex = 0.5)
         points(val_pts_df$x, val_pts_df$y, pch = 17, col = "magenta1", cex = 0.5)
         legend("bottom", legend = c("Train", "Val"), col = c("blue", "magenta1"), pch = c(16, 17), horiz = TRUE, bg="white", cex=1.0)
 
         par(mar = margin_default)
-
-        plot(true_lambda_map, main = "Reference Expected Abundance", col = abundance_col_palette, range = c(0, lambda_max), extend = "max", plg = abun_legend_args)
+        # --- *** AXIS FIX: Added axes = TRUE *** ---
+        # Use pax (plotaxt) to control the legend's axis
+        plot(true_lambda_map, main = "Reference Lambda", col = abundance_col_palette, range = c(0, lambda_max), extend = "max", pax = abun_axis_args, axes = TRUE)
         
-        plot(true_psi_map, main = "Reference Occupancy Probability", col = occupancy_col_palette, range=c(0,1))
+        # --- *** AXIS FIX: Added axes = TRUE *** ---
+        plot(true_psi_map, main = "Reference Psi", col = occupancy_col_palette, range=c(0,1), axes = TRUE)
 
         # MODIFIED: Text block at (2,4) shows simulation stats instead of parameters
         par(mar=c(0,0,0,0))
@@ -652,6 +703,7 @@ for (current_train_size in training_sizes) {
             }
 
             par(mar = margin_default)
+            # This plot (col 1) HAS axes by default because legend=FALSE
             plot(state_cov, main = trailing_ref_str, legend = FALSE, col = "white")
             plot(res$polygons$geometry, add = TRUE, border = "gray30", col = alpha("gray", 0.3))
             points(train_pts_df$x, train_pts_df$y, pch = 16, col = "blue", cex = 0.5)
@@ -661,11 +713,11 @@ for (current_train_size in training_sizes) {
                 
                 # This is a failed fit. Plot "Fit Failed" for both abundance and occupancy.
                 par(mar = margin_default)
-                plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", main = paste("Abundance Estimated from", current_scenario_name))
+                plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", main = expression(paste(lambda, "Estimated from", current_scenario_name)))
                 text(0, 0, "Fit Failed", cex=1.5)
                 
                 par(mar = margin_default)
-                plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", main = paste("Occupancy Estimated from", current_scenario_name))
+                plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n", main = expression(paste(psi, "Estimated from", current_scenario_name)))
                 text(0, 0, "Fit Failed", cex=1.5)
                 
             } else {
@@ -676,29 +728,32 @@ for (current_train_size in training_sizes) {
                 # Create a copy of the map for plotting
                 lambda_map_to_plot <- res$pred_lambda_map
                 
-                # Get all values from the raster
-                v <- values(lambda_map_to_plot)
+                # Get the original values
+                v_cleaned <- values(lambda_map_to_plot)
                 
-                # Clamp to lambda_max
-                v_temp <- v
-
-                # FIX: Create a "base" vector of the correct length, filled with lambda_max
-                v <- rep(lambda_max, length(v_temp)) 
-
-                # Now, find all valid (good) values
-                is_valid <- !is.infinite(v_temp) & !is.na(v_temp) & !is.nan(v_temp)
-
-                # Copy only the good values from v_temp back into v
-                v[is_valid] <- v_temp[is_valid]
-
-                # Set the cleaned values back into the raster
-                values(lambda_map_to_plot) <- v
+                # 1. Replace all non-finite values (NA, Inf, NaN) with lambda_max.
+                #    This ensures the vector is now fully finite.
+                v_cleaned[!is.finite(v_cleaned)] <- lambda_max
                 
-                # Plot the clamped map. This will no longer have white spots.
-                plot(lambda_map_to_plot, main = paste("Abundance Estimated from", current_scenario_name), col = abundance_col_palette, range = c(0, lambda_max), extend = "max", plg = abun_legend_args)
+                # 2. Now that it's finite, clamp any values > lambda_max
+                #    (This catches the huge MSE numbers, e.g., 5.86e+29)
+                v_cleaned[v_cleaned > lambda_max] <- lambda_max
+                
+                # 3. Clamp any values < 0 (just in case)
+                v_cleaned[v_cleaned < 0] <- 0
+                
+                # 4. Set the fully cleaned and clamped values back into the raster
+                values(lambda_map_to_plot) <- v_cleaned
+                
+                # 5. Plot the clamped map. 
+                # --- *** AXIS FIX: Added axes = TRUE *** ---
+                plot(lambda_map_to_plot, main = paste("Abundance Estimated from", current_scenario_name), 
+                     col = abundance_col_palette, range = c(0, lambda_max), 
+                     extend = "max", pax = abun_axis_args, axes = TRUE)
                 
                 # Plot the occupancy map
-                plot(res$pred_psi_map, main = paste("Occupancy Estimated from", current_scenario_name), col = occupancy_col_palette, range=c(0,1))
+                # --- *** AXIS FIX: Added axes = TRUE *** ---
+                plot(res$pred_psi_map, main = paste("Occupancy Estimated from", current_scenario_name), col = occupancy_col_palette, range=c(0,1), axes = TRUE)
             }
 
             # MODIFIED: Text blocks for scenarios no longer show estimated parameters
@@ -768,8 +823,14 @@ methods <- unique(summary_plot_df$Clustering)
 colors <- viridis(length(methods))
 method_names <- as.character(methods)
 
+# --- *** FIX 1: HANDLE NON-FINITE YLIM VALUES *** ---
 # Plot 1: Landscape Lambda MSE
-y_range_lambda <- range(summary_plot_df$Lambda.LS.MSE, na.rm = TRUE)
+finite_lambda_mse <- summary_plot_df$Lambda.LS.MSE[is.finite(summary_plot_df$Lambda.LS.MSE)]
+y_range_lambda <- if(length(finite_lambda_mse) > 0) range(finite_lambda_mse, na.rm = TRUE) else c(0, 1)
+# Handle case where range might still be Inf
+if (any(!is.finite(y_range_lambda))) y_range_lambda <- c(0, 1)
+
+
 plot(NULL, xlim = range(training_sizes), ylim = y_range_lambda, 
      xlab = "Training Set Size", ylab = "Landscape Lambda MSE", 
      main = "Lambda MSE vs. Training Size")
@@ -784,10 +845,15 @@ legend("topright", legend = method_names, col = colors, lty = 1, pch = 19, bty =
 
 
 # Plot 2: Landscape Psi MSE
-y_range_psi <- range(summary_plot_df$Psi.LS.MSE, na.rm = TRUE)
+finite_psi_mse <- summary_plot_df$Psi.LS.MSE[is.finite(summary_plot_df$Psi.LS.MSE)]
+y_range_psi <- if(length(finite_psi_mse) > 0) range(finite_psi_mse, na.rm = TRUE) else c(0, 1)
+# Handle case where range might still be Inf
+if (any(!is.finite(y_range_psi))) y_range_psi <- c(0, 1)
+
 plot(NULL, xlim = range(training_sizes), ylim = y_range_psi, 
      xlab = "Training Set Size", ylab = "Landscape Psi MSE", 
      main = "Psi MSE vs. Training Size")
+# --- *** END FIX 1 *** ---
 
 for (i in 1:length(methods)) {
   method_data <- summary_plot_df %>% 
