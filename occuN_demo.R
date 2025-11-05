@@ -1,21 +1,7 @@
 #########################################################
 # Script for occuN Clustering Comparison Plot
 #
-# --- MODIFIED: 2-SPECIES SIMULATION ---
-#
-# This script simulates two "species" on a single landscape
-# to test the performance of different site-delineation
-# methods.
-#
-# 1. Species A (Generalist):
-#    - Abundance: Non-spatial (intercept-only).
-#    - "True" Site: 1-cellSq (pixel-as-site).
-#    - Hypothesis: 1-cellSq analysis will perform best.
-#
-# 2. Species B (Specialist):
-#    - Abundance: Spatially-structured (follows covariates).
-#    - "True" Site: clustGeo (patches).
-#    - Hypothesis: clustGeo analysis will perform best.
+# (UPDATED BASED ON RECOMMENDATIONS)
 #
 #########################################################
 
@@ -53,7 +39,6 @@ set.seed(123) # for reproducibility
 # 2. HELPER FUNCTIONS
 #######################
 
-# --- No changes to helper functions ---
 
 # Fits the occuN model and calculates metrics.
 fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster, val_data, n_restarts = 30, optimizer_method = "BFGS") {
@@ -61,6 +46,8 @@ fit_and_evaluate_occuN <- function(y_data, obs_covs, w_matrix, landscape_raster,
     # a. Create the unmarkedFrame
     umf <- unmarked::unmarkedFrameOccuN(y = y_data, cellCovs = as.data.frame(landscape_raster),
                                 obsCovs = obs_covs, w = w_matrix)
+
+    
 
     # Multiple restarts logic
     best_fit <- NULL
@@ -172,11 +159,10 @@ n_cells_side = 50
 landscape <- rast(nrows = n_cells_side, ncols = n_cells_side, xmin = 0, xmax = n_cells_side, ymin = 0, ymax = n_cells_side, crs="EPSG:32610")
 n_cells <- ncell(landscape)
 
-# --- NEW COVARIATE GENERATION (REQUEST 1) ---
 # Create a "blob-like" covariate by smoothing random noise
 state_cov_noise <- rast(landscape)
 values(state_cov_noise) <- runif(n_cells)
-# Use a 5-cell circular moving window to smooth the noise into blobs
+# Use a 3-cell circular moving window to smooth the noise into blobs
 focal_window <- focalMat(state_cov_noise, 3, "circle") 
 state_cov_blobby <- terra::focal(state_cov_noise, w = focal_window, fun = "mean", na.rm = TRUE)
 
@@ -184,32 +170,37 @@ state_cov_blobby <- terra::focal(state_cov_noise, w = focal_window, fun = "mean"
 state_cov <- rast(landscape)
 values(state_cov) <- scales::rescale(values(state_cov_blobby))
 names(state_cov) <- "state_cov"
-# --- END NEW COVARIATE ---
 
 # Prepare shared data (constant across species)
 cell_covs_df <- as.data.frame(state_cov, cells = TRUE)
 X_truth_all_cells <- model.matrix(~ state_cov, data = cell_covs_df) # Used for both species
 
 
-# --- MODIFIED: Weighted sampling for initial points (to create co-located points) ---
+# Weighted sampling for initial points (to create co-located points) ---
 n_train_points <- 2000
 n_val_points <- 1000
 n_points_total <- n_train_points + n_val_points
-n_unique_locations <- 800 # --- NEW: Define # of unique locations to sample from
+n_unique_locations <- 1500 # Define # of unique locations to sample from
 
 cat("Sampling", n_unique_locations, "unique locations with weights based on state_cov...\n")
 
 # Get covariate values to use as weights
-prob_weights <- values(state_cov)
-prob_weights[is.na(prob_weights)] <- 0 
-prob_weights <- prob_weights^4 # Power to increase bias
-prob_weights <- prob_weights + 1e-6 
+# prob_weights <- values(state_cov)
+# prob_weights[is.na(prob_weights)] <- 0 
+# prob_weights <- prob_weights^1 # Power to increase bias
+# prob_weights <- prob_weights + 1e-6 
 
 # Sample cell indices based on weights for UNIQUE locations
+# sampled_cell_indices <- sample(1:ncell(state_cov), 
+#                                size = n_unique_locations, 
+#                                replace = TRUE, # Allow multiple unique locations per cell
+#                                prob = prob_weights)
+
 sampled_cell_indices <- sample(1:ncell(state_cov), 
                                size = n_unique_locations, 
-                               replace = TRUE, # Allow multiple unique locations per cell
-                               prob = prob_weights)
+                               replace = TRUE) # Allow multiple unique locations per cell
+                               
+
 
 # Get center coordinates of sampled cells
 cell_coords <- xyFromCell(state_cov, sampled_cell_indices)
@@ -222,16 +213,17 @@ rand_y <- runif(n_unique_locations, min = cell_coords[, "y"] - res_y/2, max = ce
 
 unique_locations_df <- data.frame(x = rand_x, y = rand_y)
 
-# --- NEW: Create total points by sampling UNIQUE locations WITH REPLACEMENT ---
+# Create total points by sampling UNIQUE locations WITH REPLACEMENT ---
 cat("Generating", n_points_total, "total points by sampling unique locations with replacement...\n")
 sampled_rows_idx <- sample(1:n_unique_locations, n_points_total, replace = TRUE)
 points_df <- unique_locations_df[sampled_rows_idx, ]
 points_df$id <- 1:n_points_total # Add ID
 cat("Done.\n")
-# --- END MODIFIED: Weighted/Co-located sampling ---
+
+# --- CHANGE 1: Calculate n_unique_pts ONCE ---
+n_unique_pts <- nrow(unique(points_df[, c("x", "y")]))
 
 # Split into train/validation (constant across experiments)
-# NOTE: n_train_total is now n_train_points
 train_pts_df_base <- points_df %>% sample_n(n_train_points) # Base 2000 training points
 val_pts_df <- points_df %>% anti_join(train_pts_df_base, by = "id") # Remaining 1000 validation points
 
@@ -242,27 +234,29 @@ val_cell_indices <- cellFromXY(state_cov, val_pts_df[,c("x","y")])
 val_pts_df$obs_cov <- runif(nrow(val_pts_df)) # Constant obs_cov for validation
 
 ###############################################################
-# 4. DEFINE SPECIES SCENARIOS (REQUEST 2)
+# 4. DEFINE SPECIES SCENARIOS
 ###############################################################
 
 species_scenarios <- list(
     
     "Species_A_Generalist" = list(
-        # Generalist: No spatial variation (slope = 0)
-        # Tuned to match prevalence of Species B
-        beta_true = c("(Intercept)" = -1.0, "state_cov" = 2.5),
-        alpha_true = c("(Intercept)" = 4.0, "obs_cov" = -1.0),
+        # Generalist: No spatial variation
+        # --- CHANGE 2: BETA PARAMETERS SCALED FOR AREA ---
+        # Original: beta_true = c("(Intercept)" = -1.0, "state_cov" = 1.0),
+        beta_true = c("(Intercept)" = -3.7, "state_cov" = 1.0),
+        alpha_true = c("(Intercept)" = 2.0, "obs_cov" = -1.0),
         
         # The "true" or "reference" clustering for a generalist
-        # is the pixel-as-site (1-cellSq)
+        # is grids (cellSq)
         ref_clustering_name = "5-cellSq"
     ),
     
     "Species_B_Specialist" = list(
         # Specialist: Strong, patchy spatial variation
-        # Tuned to match prevalence of Species A
-        beta_true = c("(Intercept)" = -3.0, "state_cov" = 5.0),
-        alpha_true = c("(Intercept)" = 2.0, "obs_cov" = -1.0),
+        # --- CHANGE 3: BETA PARAMETERS SCALED FOR AREA ---
+        # Original: beta_true = c("(Intercept)" = -3.0, "state_cov" = 5.0),
+        beta_true = c("(Intercept)" = -3.9, "state_cov" = 5.0),
+        alpha_true = c("(Intercept)" = 1.5, "obs_cov" = -1.0),
         
         # The "true" or "reference" clustering for a specialist
         # follows the patches (clustGeo)
@@ -279,7 +273,9 @@ if (!dir.exists(output_dir)) {
     dir.create(output_dir)
 }
 
-selected_optimizer <- "nlminb"
+# optimizers = "BFGS", "L-BFGS-B", "CG", "Nelder-Mead", "SANN", "nlminb" 
+
+selected_optimizer <- "Nelder-Mead"
 # --- REMOVED: training_sizes loop and training_sets_list ---
 
 # Initialize lists to store summary statistics for efficient CSV export
@@ -288,7 +284,7 @@ performance_metrics_list <- list()
 estimated_params_list <- list()
 perf_counter <- 1
 
-# --- NEW OUTER LOOP FOR SPECIES ---
+# OUTER LOOP FOR SPECIES
 for (species_name in names(species_scenarios)) {
     
     cat(paste("\n=============================================\n"))
@@ -370,10 +366,11 @@ for (species_name in names(species_scenarios)) {
         D1 <- dist(train_pts_df[, c("x", "y")])
         D0 <- (D0 - min(D0)) / (max(D0) - min(D0))
         D1 <- (D1 - min(D1)) / (max(D1) - min(D1))
-        ref_tree <- hclustgeo(D0, D1, alpha = 0.1)
+        ref_tree <- hclustgeo(D0, D1, alpha = 0.5)
 
         ref_k_proportion <- as.numeric(sub(".*-", "", ref_scenario_name)) / 100
-        ref_k <- floor(ref_k_proportion * nrow(train_pts_df))
+        # --- CHANGE 4: Use n_unique_pts for k calculation ---
+        ref_k <- floor(ref_k_proportion * n_unique_pts) 
         cat(paste("Using k =", ref_k, "for clustGeo reference clustering.\n"))
         ref_clusters <- cutree(ref_tree, k = ref_k)
     } else {
@@ -384,14 +381,39 @@ for (species_name in names(species_scenarios)) {
 
     train_pts_df$ref_site_id <- ref_clusters
 
-    # --- START: MODIFIED POLYGON CREATION ---
-    # Determine the true occupancy of reference sites
-    ref_polygons_sf <- train_pts_df %>%
-        st_as_sf(coords = c("x", "y"), crs = st_crs(landscape)) %>%
-        group_by(ref_site_id) %>%
-        summarise(geometry = st_combine(geometry), .groups = 'drop') %>%  # 1. Combine points
-        mutate(geometry = st_convex_hull(geometry)) %>%                  # 2. Get hull (might be POINT, LINE, or POLYGON)
-        mutate(geometry = st_buffer(geometry, dist = 0.5))               # 3. Buffer to *guarantee* it's a POLYGON
+    # --- START: CHANGE 5: MODIFIED POLYGON CREATION ---
+    # Conditionally create polygons based on ref_scenario_name
+    if (startsWith(ref_scenario_name, "clustGeo")) {
+        # Determine the true occupancy of reference sites using CONVEX HULLS
+        ref_polygons_sf <- train_pts_df %>%
+            st_as_sf(coords = c("x", "y"), crs = st_crs(landscape)) %>%
+            group_by(ref_site_id) %>%
+            summarise(geometry = st_combine(geometry), .groups = 'drop') %>%  # 1. Combine points
+            mutate(geometry = st_convex_hull(geometry)) %>%                  # 2. Get hull (might be POINT, LINE, or POLYGON)
+            mutate(geometry = st_buffer(geometry, dist = 0.5))               # 3. Buffer to *guarantee* it's a POLYGON
+    
+    } else {
+        # Use the *actual* grid squares for reference polygons
+        cell_side <- as.numeric(gsub("-cellSq", "", ref_scenario_name))
+        ext <- ext(landscape); res_x <- xres(landscape); res_y <- yres(landscape)
+        site_representatives <- train_pts_df %>% group_by(ref_site_id) %>% slice(1) %>% ungroup()
+        
+        ref_polygons_sf <- site_representatives %>%
+            mutate(
+                grid_col = floor((x - ext$xmin) / (res_x * cell_side)),
+                grid_row = floor((ext$ymax - y) / (res_y * cell_side)),
+                xmin_sq = ext$xmin + grid_col * res_x * cell_side,
+                xmax_sq = xmin_sq + res_x * cell_side,
+                ymax_sq = ext$ymax - grid_row * res_y * cell_side,
+                ymin_sq = ymax_sq - res_y * cell_side
+            ) %>%
+            rowwise() %>%
+            mutate(geometry = list(st_polygon(list(matrix(
+                    c(xmin_sq, ymin_sq, xmax_sq, ymin_sq, xmax_sq, ymax_sq, xmin_sq, ymax_sq, xmin_sq, ymin_sq),
+                    ncol = 2, byrow = TRUE
+            ))))) %>%
+            ungroup() %>% st_as_sf(crs = st_crs(landscape)) %>% select(ref_site_id, geometry)
+    }
     
     # Check for empty/invalid geometries and remove them
     ref_polygons_sf <- ref_polygons_sf[!st_is_empty(ref_polygons_sf), ]
@@ -408,7 +430,7 @@ for (species_name in names(species_scenarios)) {
     site_lambda_map <- data.frame(ref_site_id = ref_polygons_sf$ref_site_id, true_site_lambda = true_site_lambda)
     
     # Ensure ref_site_id is present for the join
-    ref_polygons_sf <- ref_polygons_sf %>% mutate(ref_site_id = 1:nrow(.))
+    ref_polygons_sf <- ref_polygons_sf %>% mutate(ref_site_id = seq_len(nrow(.)))
     site_lambda_map <- data.frame(ref_site_id = ref_polygons_sf$ref_site_id, true_site_lambda = true_site_lambda)
     
     train_pts_df <- train_pts_df %>%
@@ -432,9 +454,8 @@ for (species_name in names(species_scenarios)) {
 
     # Add descriptive stats for this Species
     new_desc_row <- data.frame(
-        "Species" = species_name, # --- NEW COLUMN ---
+        "Species" = species_name,
         "Reference.Clustering" = ref_scenario_name,
-        # "Training.Size" = n_train_points, # --- REMOVED ---
         "Number.of.Clusters" = length(unique(train_pts_df$ref_site_id)),
         "Mean.Number.of.Points.in.Cluster" = round(mean(points_per_cluster), 4),
         "SD.Number.of.points.in.Clusters" = round(sd(points_per_cluster), 4),
@@ -448,7 +469,7 @@ for (species_name in names(species_scenarios)) {
     descriptive_stats_list[[length(descriptive_stats_list) + 1]] <- new_desc_row
 
     ########################################################################
-    # 6. ANALYSIS CLUSTERING (REQUEST 3)
+    # 6. ANALYSIS CLUSTERING
     #    Apply all 5 analysis methods to this species' data
     ########################################################################
 
@@ -459,7 +480,7 @@ for (species_name in names(species_scenarios)) {
     D0 <- (D0 - min(D0)) / (max(D0) - min(D0)); D1 <- (D1 - min(D1)) / (max(D1) - min(D1))
     analysis_tree <- hclustgeo(D0, D1, alpha = 0.5) # Use this tree for all analysis clusters
     
-    n_unique_pts <- nrow(unique(train_pts_df[, c("x", "y")]))
+    # NOTE: n_unique_pts is now defined globally (Change 1)
     k_values <- c("clustGeo-50-25" = floor(0.25 * n_unique_pts), 
                   "clustGeo-50-90" = floor(0.90 * n_unique_pts), 
                   "clustGeo-50-5" = floor(0.05 * n_unique_pts))
@@ -583,9 +604,8 @@ for (species_name in names(species_scenarios)) {
 
         new_perf_row <- data.frame(
             "No." = perf_counter,
-            "Species" = species_name, # --- NEW COLUMN ---
+            "Species" = species_name,
             "Reference.Clustering" = ref_scenario_name,
-            # "Training.Size" = n_train_points, # --- REMOVED ---
             "Clustering" = current_scenario_name,
             "Optimizer" = selected_optimizer,
             "Cell.Lambda.Mean" = round(pred_cell_stats[1, "mean"], 4),
@@ -824,3 +844,10 @@ write.csv(estimated_params_df, file.path(output_dir, "estimated_parameters.csv")
 # --- REMOVED: SECTION 9 (SUMMARY PLOT) ---
 
 cat("\n--- All simulations complete. ---\n")
+
+
+
+
+
+
+
