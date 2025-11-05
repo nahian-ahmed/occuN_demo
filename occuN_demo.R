@@ -225,7 +225,12 @@ results <- data.frame(
 
 print(results)
 
-write.csv(results, "params.csv", row.names = FALSE)
+output_dir <- "output"
+if (!dir.exists(output_dir)) {
+    dir.create(output_dir)
+}
+
+write.csv(results, file.path(output_dir, "params.csv"), row.names = FALSE)
 
 ##########
 # 9. Plot Landscape and Sites
@@ -317,7 +322,7 @@ combined_plot <- p_covariate + p_abundance + p_occupancy +
 
 
 # Save the combined plot
-ggsave("plot.png", 
+ggsave(file.path(output_dir, "plot.png"), 
        plot = combined_plot, 
        dpi = 300, 
        width = 18, 
