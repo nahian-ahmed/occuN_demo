@@ -4,38 +4,18 @@
 # -----------------------------------------------------------------
 
 # --- Installation ---
-# Set a CRAN mirror if one isn't set
+# Set a CRAN mirror
 options(repos = c(CRAN = "https://cloud.r-project.org/"))
 
-# Quietly install devtools if not present
-suppressMessages(
-    if (!require("devtools")) {
-        install.packages("devtools", quiet = TRUE)
-        library(devtools)
-    }
-)
+packages <- c("devtools", "ggplot2", "patchwork")
+for(p in packages){
+    if (!requireNamespace(p, quietly = FALSE)) install.packages(p)
+}
 
 # Quietly install forked 'unmarked' package
 suppressMessages(
-        devtools::install_github("nahian-ahmed/unmarked", ref = "occuN", force = TRUE, quiet = FALSE)
+    devtools::install_github("nahian-ahmed/unmarked", ref = "occuN", force = TRUE, quiet = FALSE)
 )
-
-# Quietly install plotting packages
-suppressMessages(
-    if (!require("ggplot2")) {
-        install.packages("ggplot2", quiet = TRUE)
-        library(ggplot2)
-    }
-)
-
-# Quietly install patchwork
-suppressMessages(
-    if (!require("patchwork")) {
-        install.packages("patchwork", quiet = TRUE)
-        library(patchwork)
-    }
-)
-
 
 # --- Load required libraries ---
 library(unmarked)
@@ -551,7 +531,7 @@ p_err_alpha_cov <- ggplot(all_results_df[all_results_df$Parameter == "alpha (det
                                                     aes(x = M_factor, y = Error)) +
     geom_boxplot() +
     geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
-    labs(title = "Detection Slope (alpha_cov1)", 
+    labs(title = "Detection Slope", 
              x = "M (Sites)", 
              y = "Error (True - Est.)") +
     theme_bw()
