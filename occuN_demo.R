@@ -128,7 +128,7 @@ get_subset_landscape <- function(M_target, site_dim, full_cell_row, full_cell_co
     site_ids_to_keep <- sort(site_ids_in_subset) # Should be 1:M_target
     
     if (length(site_ids_to_keep) != M_target) {
-        warning(sprintf("Mismatch! Expected %d sites, but found %d unique sites in subset.", M_target, length(site_ids_to_keep)))
+        warning(sprintf("Expected %d sites, but found %d unique sites in subset.", M_target, length(site_ids_to_keep)))
     }
     
     # --- 4. Subset all the data ---
