@@ -47,12 +47,29 @@ full_M <- full_n_sites_x * full_n_sites_y # Total number of sites (1600)
 # --- Observation parameters ---
 J_obs <- 3 # Number of surveys per site
 
+# # --- True parameter values ---
+# # Detection (alphas) for formula ~obs_cov1
+# true_alphas <- c(alpha_int = 0.5, alpha_cov = -1.0)
+
+# # State (betas) for formula ~cell_cov1
+# true_betas <- c(beta_int = -4.0, beta_cov = 2.0) 
+
+
+# # --- True parameter values ---
+# # Detection (alphas) for formula ~obs_cov1
+# true_alphas <- c(alpha_int = 0.5, alpha_cov = -1.0)
+
+# # State (betas) for formula ~cell_cov1
+# true_betas <- c(beta_int = -5.0, beta_cov = 2.0) 
+
+
 # --- True parameter values ---
 # Detection (alphas) for formula ~obs_cov1
 true_alphas <- c(alpha_int = 0.5, alpha_cov = -1.0)
 
 # State (betas) for formula ~cell_cov1
-true_betas <- c(beta_int = -4.0, beta_cov = 2.0) 
+true_betas <- c(beta_int = -5.0, beta_cov = 1.0) 
+
 
 # --- Model settings ---
 # optimizers = "BFGS", "L-BFGS-B", "CG", "Nelder-Mead", "SANN", "nlminb" 
